@@ -1,0 +1,16 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "cement-fineness-opt"
+version = "0.1.0"
+description = "Standalone preprocess → train → predict+optimize scripts for cement-fineness APC."
+requires-python = ">=3.10"
+# Runtime deps are intentionally NOT pinned here — install into the existing `CBM` conda env
+# (which already has pandas/numpy/scikit-learn/xgboost/lightgbm/catboost/optuna/joblib/mlflow)
+# via `pip install -e . --no-deps`. See README.md for the dependency list.
+
+[tool.setuptools]
+# Flat layout: the four vendored libraries are top-level packages at the repo root.
+packages = ["config", "utils", "opt_algo", "feat_eng"]

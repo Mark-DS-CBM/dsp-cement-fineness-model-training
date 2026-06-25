@@ -1,0 +1,25 @@
+# Data & results (large / generated) — keep the folder scaffolding only
+data/*
+results/*
+!**/.gitkeep
+
+# MLflow store (repo-local)
+mlflow.db
+mlflow.db-journal
+mlruns/
+
+# CatBoost training logs (written to cwd during training)
+catboost_info/
+**/catboost_info/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.ipynb_checkpoints/
+
+# Model weights (if ever placed outside results/)
+*.joblib
+
+.DS_Store
+**/.DS_Store
