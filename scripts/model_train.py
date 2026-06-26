@@ -37,8 +37,9 @@ import joblib
 import optuna
 import pandas as pd
 
-# Vendored packages (config/, utils/) are importable via the editable install (pip install -e .).
+# Vendored packages (config/, utils/, feat_eng/) are importable via the editable install (pip install -e .).
 from config.pot_config import get_config, RESULTS_DIR  # noqa: E402
+from feat_eng.registry import get_experiment  # noqa: E402
 from utils._modeling_utils import (  # noqa: E402
     VALID_MODELS, run_nested_cv, summarize_fold_records, make_objective, make_model,
 )
@@ -55,6 +56,26 @@ N_INNER_FOLDS = 5
 RANDOM_STATE = 42
 OPTUNA_SEED = 42
 ACTIONABLE = "sep_motor_speed"
+# feat_eng experiment applied to every pot by default (override with --feat-eng / --no-feat-eng).
+# 04_seasonal adds time-of-arrival cyclic + Thai-season features derived from the `hour` column;
+# they are independent of the actionable param (AFFECTS_ACTIONABLE=False), so they shift the
+# baseline prediction by time-of-year/day without changing the sep_motor_speed search surface.
+DEFAULT_FEAT_ENG = "04_seasonal"
+
+
+def apply_feat_eng(df, experiment):
+    """Apply a feat_eng experiment to ``df``; return (df, new_feature_names).
+
+    Applied before the training-window filter so the experiment sees the raw string ``hour``
+    column it parses. ``experiment`` of None/"" /"none" disables FE and returns no new features.
+    """
+    if not experiment or str(experiment).lower() == "none":
+        print("Feature engineering: disabled (no feat_eng experiment applied).")
+        return df, []
+    exp = get_experiment(experiment)
+    print(f"Feature engineering: {experiment} — {exp['description']}")
+    df, new_features, _ = exp["apply"](df)
+    return df, new_features
 
 
 def _filter_training_window(df, cfg):
@@ -70,10 +91,13 @@ def _filter_training_window(df, cfg):
     return df
 
 
-def phase_a_report(df, cfg, model_name, brand, target, n_trials):
-    """Nested 5×5 CV exactly as the notebook; returns (summary, fold_records)."""
-    feature_cols = list(cfg["model_features"])               # includes 'brand'
-    num_cols = [c for c in feature_cols if c != "brand"]     # all model features are numeric
+def phase_a_report(df, cfg, model_name, brand, target, n_trials, feature_cols):
+    """Nested 5×5 CV exactly as the notebook; returns (summary, fold_records).
+
+    ``feature_cols`` is the full model-input list (incl. 'brand' and any feat_eng columns).
+    """
+    feature_cols = list(feature_cols)                        # includes 'brand'
+    num_cols = [c for c in feature_cols if c != "brand"]     # all non-brand features are numeric
 
     df_b = df[df["brand"] == brand].dropna(subset=[target])
     print(f"\n── Phase A: nested {N_OUTER_FOLDS}×{N_INNER_FOLDS} CV "
@@ -99,9 +123,12 @@ def phase_a_report(df, cfg, model_name, brand, target, n_trials):
     return summary, fold_records
 
 
-def phase_b_freeze(df, cfg, model_name, brand, target, n_trials):
-    """Re-tune on the full filtered data, refit on 100% of it, return (model, feature_order)."""
-    feature_order = [c for c in cfg["model_features"] if c != "brand"]  # numeric, no brand
+def phase_b_freeze(df, cfg, model_name, brand, target, n_trials, feature_cols):
+    """Re-tune on the full filtered data, refit on 100% of it, return (model, feature_order).
+
+    ``feature_cols`` is the full model-input list (incl. 'brand' and any feat_eng columns).
+    """
+    feature_order = [c for c in feature_cols if c != "brand"]  # numeric, no brand
     df_b = df[df["brand"] == brand].dropna(subset=[target]).reset_index(drop=True)
     X_full = df_b[feature_order]
     y_full = df_b[target]
@@ -141,6 +168,11 @@ def main():
     ap.add_argument("--brand", default=None, help="Brand (default = pot's first optimization brand).")
     ap.add_argument("--data", default=None, help="Merged CSV (default = pot_config merged_data_path).")
     ap.add_argument("--optuna-trials", type=int, default=25, help="Optuna trials per tuning (default 25).")
+    ap.add_argument("--feat-eng", default=DEFAULT_FEAT_ENG,
+                    help=f"feat_eng experiment applied to every pot (default {DEFAULT_FEAT_ENG!r}). "
+                         "Use 'none' to disable.")
+    ap.add_argument("--no-feat-eng", action="store_true",
+                    help="Disable feature engineering (equivalent to --feat-eng none).")
     ap.add_argument("--step", type=float, default=1.0,
                     help="sep_motor_speed grid step recorded in metadata bounds (default 1.0).")
     ap.add_argument("--out-dir", default=None,
@@ -162,16 +194,24 @@ def main():
     stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
     use_mlflow = not args.no_mlflow
 
+    feat_eng_exp = "none" if args.no_feat_eng else args.feat_eng
+
     print(f"=== Train {args.cm} / {target} / {brand} — model={model_name} — run {stamp} ===")
     print(f"Data: {data_path}")
     df = pd.read_csv(data_path)
+    # Feature engineering first (sees raw string `hour`), then restrict to the training window.
+    df, fe_features = apply_feat_eng(df, feat_eng_exp)
     df = _filter_training_window(df, cfg)
+
+    # Full model-input list = pot's canonical features + any feat_eng columns (all numeric).
+    feature_cols = list(cfg["model_features"]) + fe_features
 
     if use_mlflow:
         init_tracking(pot=args.cm, workflow="apc_training")
         manifest = {
             "pot": args.cm, "data_source": data_path.name, "n_rows": len(df),
-            **cfg["data_recipe"], "feature_set": list(cfg["model_features"]),
+            **cfg["data_recipe"], "feature_set": list(feature_cols),
+            "feat_eng": feat_eng_exp, "fe_features": fe_features,
             "outer_cv": {"folds": N_OUTER_FOLDS, "shuffle": True, "seed": RANDOM_STATE},
             "inner_cv": {"folds": N_INNER_FOLDS, "shuffle": True, "seed": RANDOM_STATE},
             "n_optuna_trials": args.optuna_trials,
@@ -182,7 +222,8 @@ def main():
 
     try:
         # Phase A — honest score.
-        summary, fold_records = phase_a_report(df, cfg, model_name, brand, target, args.optuna_trials)
+        summary, fold_records = phase_a_report(df, cfg, model_name, brand, target,
+                                               args.optuna_trials, feature_cols)
 
         if use_mlflow:
             start_intermediate_run(target=target, brand=brand, model_name=model_name)
@@ -200,7 +241,7 @@ def main():
 
         # Phase B — final weight on full data.
         model, feature_order, df_b, best_params, best_inner_mae = phase_b_freeze(
-            df, cfg, model_name, brand, target, args.optuna_trials)
+            df, cfg, model_name, brand, target, args.optuna_trials, feature_cols)
 
         # CV report (per-fold rows + a summary row).
         cv_rows = [{"scope": f"fold_{r['fold']}", **{k: r[k] for k in
@@ -219,6 +260,7 @@ def main():
         metadata = {
             "target": target, "pot": args.cm, "brand": brand,
             "feature_order": feature_order,
+            "feat_eng": feat_eng_exp, "fe_features": fe_features,
             "sep_motor_speed_bounds": [float(sep.min()), float(sep.max()), float(args.step)],
             "model_mae": float(summary["MAE"]),
             "is_autogluon": False,

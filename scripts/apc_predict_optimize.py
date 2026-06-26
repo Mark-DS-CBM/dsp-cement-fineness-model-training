@@ -34,8 +34,9 @@ from pathlib import Path
 import joblib
 import pandas as pd
 
-# Vendored packages (config/, opt_algo/) are importable via the editable install (pip install -e .).
+# Vendored packages (config/, opt_algo/, feat_eng/) are importable via the editable install.
 from config.pot_config import get_config, RESULTS_DIR  # noqa: E402
+from feat_eng.registry import get_experiment  # noqa: E402
 
 # ── Configuration ──────────────────────────────────────────────────────────────
 DEFAULT_POT = "CM08"             # override via --pot (e.g. CM08_bf1h for the bf1h-trained artifact)
@@ -173,6 +174,11 @@ def _build_demo_snapshot(metadata, pot):
     live 60-min snapshot. (In production the snapshot is built from Ignition tags.)"""
     cfg = get_config(pot)
     df = pd.read_csv(cfg["merged_data_path"])
+    # Recompute the feat_eng columns the model was trained on (they are derived at runtime from
+    # `hour`, not stored in the merged CSV). Must match metadata["feat_eng"] so feature_order resolves.
+    fe_exp = metadata.get("feat_eng", "none")
+    if fe_exp and str(fe_exp).lower() != "none":
+        df, _, _ = get_experiment(fe_exp)["apply"](df)
     df_b = df[df["brand"] == BRAND].dropna(subset=[TARGET])
     if df_b.empty:
         raise RuntimeError(f"No {BRAND} rows with {TARGET} in {cfg['merged_data_path']}")
