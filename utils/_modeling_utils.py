@@ -1,16 +1,24 @@
-"""Shared utilities for nested-CV modelling notebooks (01_2, 02_1).
+"""Shared utilities for the modelling notebooks (01_2, 02_1) + model_train.py.
 
-Both notebooks evaluate per (brand, target, model) under nested 5x5 CV:
-- Outer 5-fold KFold = honest performance estimate (every row is a val row once).
-- Inner 5-fold KFold inside each outer-train slice = Optuna hyperparameter tuning.
+Two evaluation schemes are supported via `run_nested_cv(split_mode=..., inner_split=...)`:
 
-Each outer fold gets its own best hyperparameters (this is expected and is part of
-the honest estimate's variance). 02_1 does NOT consume hyperparameters from 01_2;
-it re-tunes inside its own outer folds so the FE comparison is end-to-end consistent
-with whatever feature set the experiment produces.
+- **Forward holdout** (`split_mode="holdout"`, `inner_split="ts"`) — the current
+  forward-evaluation gate. Time-sort the brand rows, hold out the most-recent
+  `test_frac` as the test set, tune hyperparameters on the earlier train span via inner
+  `TimeSeriesSplit`, refit on the train span, score once. Production predicts forward in
+  time, so this is the honest deployment estimate. It is *not* nested (one train/test
+  split, not an outer loop).
 
-Encoding / scaling is fit on the outer-train slice and reused for the outer-val slice
-plus the inner CV — same convention as the legacy single-split pipeline.
+- **Nested IID CV** (`split_mode="iid"`, `inner_split="kfold"`, the legacy defaults) —
+  outer shuffled KFold = honest estimate (every row is a val row once); inner shuffled
+  KFold inside each outer-train slice = Optuna tuning. Each outer fold gets its own best
+  hyperparameters. Retained as the baseline for comparison.
+
+02_1 does NOT consume hyperparameters from 01_2; it re-tunes inside its own evaluation
+so the FE comparison is end-to-end consistent with whatever feature set it produces.
+
+Encoding / scaling is fit on the train slice and reused for the val slice plus the inner
+CV — same convention as the legacy single-split pipeline.
 
 Models supported: KNN, XGBoost, LightGBM, CatBoost. AutoGluon is intentionally
 excluded.
@@ -31,7 +39,7 @@ from sklearn.metrics import (
     mean_absolute_error, mean_squared_error, r2_score,
     mean_absolute_percentage_error,
 )
-from sklearn.model_selection import KFold, cross_val_score
+from sklearn.model_selection import KFold, TimeSeriesSplit, cross_val_score
 
 import xgboost as xgb
 import lightgbm as lgb
@@ -156,8 +164,9 @@ def make_model(model_name: str, params: dict[str, Any], random_state: int = 42):
 # Optuna search spaces
 # ────────────────────────────────────────────────────────────────────────────
 
-def _suggest_knn(trial, n_train: int):
-    cv_train_size = int(n_train * 4 / 5)  # inner KFold(5) train slice
+def _suggest_knn(trial, cv_train_size: int):
+    # `cv_train_size` = rows available in the *smallest* inner-CV train fold (computed
+    # by make_objective per splitter), so n_neighbors never exceeds the train rows.
     max_neighbors = min(50, max(3, cv_train_size - 1))
     max_leaf_size = min(100, max(10, cv_train_size - 1))
     return {
@@ -219,18 +228,38 @@ _SUGGESTERS = {
 
 
 def make_objective(model_name: str, X_train, y_train,
-                   n_inner_folds: int, random_state: int) -> Callable:
-    """Build an Optuna objective that scores params by inner KFold CV mean MAE."""
+                   n_inner_folds: int, random_state: int,
+                   inner_split: str = "kfold") -> Callable:
+    """Build an Optuna objective that scores params by inner CV mean MAE.
+
+    `inner_split` selects the inner splitter used for hyperparameter search:
+    - ``"kfold"`` (default): shuffled ``KFold`` — IID tuning (legacy nested-CV path).
+    - ``"ts"``: ``TimeSeriesSplit`` — chronological tuning on the (time-sorted) train
+      span, used by the forward-holdout scheme. The forward-holdout has only this one
+      TimeSeriesSplit level, so the inner-train slices stay usable even on short windows.
+    """
     if model_name not in _SUGGESTERS:
         raise ValueError(f"Unknown model: {model_name!r}. Valid: {VALID_MODELS}")
+    if inner_split not in ("kfold", "ts"):
+        raise ValueError(f"Unknown inner_split: {inner_split!r}. Valid: 'kfold', 'ts'.")
 
     n_train = len(X_train)
     suggester = _SUGGESTERS[model_name]
+    # Rows in the *smallest* inner-CV train fold (only KNN's neighbor cap uses this;
+    # the tree suggesters ignore the size arg). TimeSeriesSplit's first fold trains on
+    # ~n/(k+1); shuffled KFold trains on (k-1)/k of the rows.
+    if inner_split == "ts":
+        min_cv_train = max(1, n_train // (n_inner_folds + 1))
+    else:
+        min_cv_train = int(n_train * (n_inner_folds - 1) / n_inner_folds)
 
     def objective(trial):
-        params = suggester(trial, n_train)
+        params = suggester(trial, min_cv_train)
         model = make_model(model_name, params, random_state)
-        cv = KFold(n_splits=n_inner_folds, shuffle=True, random_state=random_state)
+        if inner_split == "ts":
+            cv = TimeSeriesSplit(n_splits=n_inner_folds)
+        else:
+            cv = KFold(n_splits=n_inner_folds, shuffle=True, random_state=random_state)
         scores = cross_val_score(
             model, X_train, y_train, cv=cv,
             scoring='neg_mean_absolute_error', n_jobs=-1,
@@ -252,26 +281,58 @@ def make_brand_folds(
     feature_cols: list[str],
     n_splits: int = 5,
     random_state: int = 42,
+    split_mode: str = "iid",
+    test_frac: float = 0.2,
 ) -> Iterator[tuple]:
-    """Yield outer-CV folds for one brand.
+    """Yield evaluation folds for one brand.
 
     Each yield: ``(X_train, X_val, y_train, y_val, hours_train, hours_val)``.
 
-    `df_test_source is None` (regular pots, e.g. CM04, CM08):
-        Standard shuffled 5-fold KFold on `df_current[brand==b]`.
+    `split_mode="iid"` (default) — shuffled `KFold` cross-validation:
+        `df_test_source is None` (regular pots, e.g. CM04, CM08):
+            Standard shuffled `n_splits`-fold KFold on `df_current[brand==b]`.
+        `df_test_source` provided (e.g. CM08_off75 → CM08):
+            Folds are defined on `df_test_source`'s brand rows by `hour`. For each
+            fold, val rows come from `df_test_source` (preserving the source pot's
+            preprocessed values exactly). Train rows are `df_current` rows whose
+            `hour` is NOT in that fold's val hours. Off75-only hours all flow into
+            training across all folds.
 
-    `df_test_source` provided (e.g. CM08_off75 → CM08):
-        Folds are defined on `df_test_source`'s brand rows by `hour`. For each
-        fold, val rows come from `df_test_source` (preserving the source pot's
-        preprocessed values exactly). Train rows are `df_current` rows whose
-        `hour` is NOT in that fold's val hours. Off75-only hours all flow into
-        training across all folds.
+    `split_mode="holdout"` — single forward (chronological) holdout:
+        Sort the brand rows by `hour` and yield ONE fold: train = the earliest
+        `(1 - test_frac)` of rows, val = the most-recent `test_frac` of rows. This
+        is the forward-evaluation gate (production predicts forward in time). The
+        value-identity `df_test_source` path is IID-only and unsupported here.
     """
+    if split_mode not in ("iid", "holdout"):
+        raise ValueError(f"Unknown split_mode: {split_mode!r}. Valid: 'iid', 'holdout'.")
+
     feats_no_brand = [c for c in feature_cols if c != 'brand']
 
     df_cur_b = (df_current[df_current['brand'] == brand]
                 .dropna(subset=[target])
                 .reset_index(drop=True))
+
+    if split_mode == "holdout":
+        if df_test_source is not None:
+            raise NotImplementedError(
+                "split_mode='holdout' does not support the value-identity df_test_source "
+                "path (off75 augmentation). Use split_mode='iid' for those pots."
+            )
+        # Chronological order is essential — model_train.py does not pre-sort.
+        df_cur_b = df_cur_b.sort_values('hour').reset_index(drop=True)
+        n = len(df_cur_b)
+        n_test = max(1, int(round(n * test_frac)))
+        cut = n - n_test
+        X_b = df_cur_b[feats_no_brand]
+        y_b = df_cur_b[target]
+        hours_b = df_cur_b['hour']
+        yield (
+            X_b.iloc[:cut], X_b.iloc[cut:],
+            y_b.iloc[:cut], y_b.iloc[cut:],
+            hours_b.iloc[:cut], hours_b.iloc[cut:],
+        )
+        return
 
     kf = KFold(n_splits=n_splits, shuffle=True, random_state=random_state)
 
@@ -314,9 +375,10 @@ def plot_target_over_time_fold(hours_train, y_train, hours_val, y_val,
                                 target_name, brand, fold_idx, save_path=None):
     """Sanity scatter: train (steelblue) and val (coral X) points over time.
 
-    Under shuffled KFold, train and val should visibly interleave across the full
-    time range. Concentration in one period would indicate a stale `random_state`
-    or upstream sort bug.
+    Under the forward holdout, val is the most-recent contiguous block (the future
+    tail) and train is everything earlier — they should NOT interleave. Under the
+    legacy shuffled KFold they should interleave across the full time range; mixing
+    there would indicate a stale `random_state` or upstream sort bug.
     """
     fig, ax = plt.subplots(figsize=(14, 4))
 
@@ -364,8 +426,19 @@ def run_nested_cv(
     optuna_seed: int = 42,
     plot_save_dir: str | None = None,
     plot_target_label: str | None = None,
+    split_mode: str = "iid",
+    inner_split: str = "kfold",
+    test_frac: float = 0.2,
 ):
-    """Run nested 5×5 CV for one (brand, target, model). Returns per-fold records.
+    """Evaluate one (brand, target, model) and return per-fold records.
+
+    `split_mode="iid"` + `inner_split="kfold"` (defaults) runs the legacy **nested 5×5
+    CV** (outer shuffled KFold = honest estimate; inner shuffled KFold = Optuna search).
+
+    `split_mode="holdout"` + `inner_split="ts"` runs the **forward holdout**: a single
+    most-recent-window test (last `test_frac`, by sample fraction), with hyperparameters
+    tuned on the earlier train span via inner `TimeSeriesSplit`. This is *not* nested —
+    there is one train/test split, not an outer loop — so it returns a single record.
 
     Each record is a dict with keys:
         fold, train_samples, val_samples, MAE, RMSE, R2, MAPE(%),
@@ -387,7 +460,9 @@ def run_nested_cv(
     fold_iter = make_brand_folds(
         df_current, df_test_source, brand, target, feature_cols,
         n_splits=n_outer_folds, random_state=random_state,
+        split_mode=split_mode, test_frac=test_frac,
     )
+    is_holdout = (split_mode == "holdout")
 
     for k, (X_otr, X_oval, y_otr, y_oval, hours_otr, hours_oval) in enumerate(fold_iter, 1):
         # Sample-size guard. Inner CV needs enough rows to split 5 ways.
@@ -407,7 +482,8 @@ def run_nested_cv(
             study_name=f'{model_name}_{target}_{brand_safe}_outer{k}',
         )
         objective = make_objective(model_name, X_otr_enc, y_otr,
-                                    n_inner_folds, random_state)
+                                    n_inner_folds, random_state,
+                                    inner_split=inner_split)
         study.optimize(objective, n_trials=n_optuna_trials, show_progress_bar=False)
 
         # Refit best params on the full outer-train, evaluate on outer-val.
@@ -440,12 +516,14 @@ def run_nested_cv(
                 save_path=save_path,
             )
 
-        # Keep last fold's fitted model + encoded val for SHAP.
-        if k == n_outer_folds:
+        # Keep last fold's fitted model + encoded val for SHAP. For the single
+        # forward holdout there is only one fold, so retain on it.
+        if is_holdout or k == n_outer_folds:
             record['last_fold_model'] = model
             record['last_fold_X_val_encoded'] = X_oval_enc
 
-        print(f"  Fold {k}/{n_outer_folds}: "
+        fold_label = "holdout" if is_holdout else f"{k}/{n_outer_folds}"
+        print(f"  Fold {fold_label}: "
               f"MAE={metrics['MAE']:.4f}, RMSE={metrics['RMSE']:.4f}, "
               f"R²={metrics['R2']:.4f}, MAPE={metrics['MAPE(%)']:.2f}%  "
               f"({train_time:.1f}s)")
@@ -456,15 +534,21 @@ def run_nested_cv(
 
 
 def summarize_fold_records(fold_records: list[dict]) -> dict:
-    """Mean ± std across outer folds for the standard metric set + total train time."""
+    """Mean ± std across folds for the standard metric set + total train time.
+
+    With a single fold (the forward holdout) there is no spread, so the ``*_std``
+    fields are reported as 0.0 rather than pandas ``NaN`` to keep downstream
+    CSVs/plots well-formed.
+    """
     if not fold_records:
         return {}
     metric_cols = ['MAE', 'RMSE', 'R2', 'MAPE(%)',
                    'Max |Residual|', 'Min |Residual|', 'Mean Residual', 'SD Residual']
     df = pd.DataFrame(fold_records)
+    single = len(df) == 1
     summary = {}
     for m in metric_cols:
         summary[m] = float(df[m].mean())
-        summary[f'{m}_std'] = float(df[m].std())
+        summary[f'{m}_std'] = 0.0 if single else float(df[m].std())
     summary['Train_Time(s)'] = float(df['Train_Time(s)'].sum())
     return summary

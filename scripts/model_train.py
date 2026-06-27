@@ -7,21 +7,22 @@ keeps MLflow logging). The model architecture is locked per mill by ``pot_config
 notebook does — no JSON is read back.
 
 Two phases (per the deployment requirement):
-  • Phase A — Evaluate & report. Run the same nested 5×5 CV the notebook uses and report the honest
-    score (MAE/RMSE/R²/MAPE, mean±std across the 5 outer folds). The reported MAE feeds ``model_mae``
-    in the frozen metadata. This estimates the *procedure*; the deployed model (Phase B) is the same
-    procedure fit on all data, so this number is a slightly conservative estimate of its performance.
-  • Phase B — Final weight. Re-tune once on the full filtered data (inner 5-fold Optuna), refit on
-    100% of it, and write the frozen artifact the APC script consumes.
+  • Phase A — Evaluate & report. Run the same forward holdout the notebooks use and report the honest
+    forward score (MAE/RMSE/R²/MAPE): time-sort the rows, hold out the most-recent ``test_frac`` as the
+    test set, tune on the earlier train span via inner ``TimeSeriesSplit``, score once. The reported
+    MAE feeds ``model_mae`` in the frozen metadata. Production predicts forward in time, so this is the
+    honest deployment estimate (not an IID shuffled-CV number).
+  • Phase B — Final weight. Re-tune once on the full filtered data (inner ``TimeSeriesSplit`` Optuna),
+    refit on 100% of it, and write the frozen artifact the APC script consumes.
 
 Artifact (written to both the canonical out-dir = apc default, AND out-dir/runs/<stamp>/ for history):
   • model.joblib          — trained regressor (raw numeric features, no scaler; tree model).
   • metadata.json         — apc contract: target, pot, brand, feature_order (numeric, no brand),
                             sep_motor_speed_bounds [min,max,step], model_mae (Phase A), is_autogluon,
                             trained_through, + provenance (trained_at, source_data_file).
-  • cv_report_<t>_<b>.csv  — per-fold + summary nested-CV metrics.
+  • cv_report_holdout_<t>_<b>.csv  — forward-holdout metrics (fold row + summary).
 
-MLflow: the nested-CV folds + final summary are logged to a repo-local SQLite store
+MLflow: the forward-holdout fold + final summary are logged to a repo-local SQLite store
 (``sqlite:///mlflow.db`` at the repo root, experiment ``<cm>_apc_training``). Browse with
 ``mlflow ui --backend-store-uri sqlite:///mlflow.db``. Disable with ``--no-mlflow``.
 
@@ -51,8 +52,8 @@ from utils.experiment_tracker import (  # noqa: E402
 
 optuna.logging.set_verbosity(optuna.logging.WARNING)
 
-N_OUTER_FOLDS = 5
-N_INNER_FOLDS = 5
+N_INNER_FOLDS = 5      # inner TimeSeriesSplit folds for Optuna tuning on the train span
+DEFAULT_TEST_FRAC = 0.2  # forward holdout: most-recent fraction held out as the test set
 RANDOM_STATE = 42
 OPTUNA_SEED = 42
 ACTIONABLE = "sep_motor_speed"
@@ -91,35 +92,37 @@ def _filter_training_window(df, cfg):
     return df
 
 
-def phase_a_report(df, cfg, model_name, brand, target, n_trials, feature_cols):
-    """Nested 5×5 CV exactly as the notebook; returns (summary, fold_records).
+def phase_a_report(df, cfg, model_name, brand, target, n_trials, feature_cols, test_frac):
+    """Forward holdout as the notebooks do; returns (summary, fold_records).
 
-    ``feature_cols`` is the full model-input list (incl. 'brand' and any feat_eng columns).
+    Time-sort the brand rows, hold out the most-recent ``test_frac`` as the test set, tune on the
+    earlier train span via inner ``TimeSeriesSplit``, score once. ``feature_cols`` is the full
+    model-input list (incl. 'brand' and any feat_eng columns).
     """
     feature_cols = list(feature_cols)                        # includes 'brand'
     num_cols = [c for c in feature_cols if c != "brand"]     # all non-brand features are numeric
 
     df_b = df[df["brand"] == brand].dropna(subset=[target])
-    print(f"\n── Phase A: nested {N_OUTER_FOLDS}×{N_INNER_FOLDS} CV "
-          f"({model_name}, brand={brand}, target={target}, rows={len(df_b):,}) ──")
-    if len(df_b) < N_OUTER_FOLDS * 2:
-        raise RuntimeError(f"Insufficient samples for {brand}/{target}: {len(df_b)}")
+    print(f"\n── Phase A: forward holdout (test_frac={test_frac}, inner TimeSeriesSplit={N_INNER_FOLDS} "
+          f"— {model_name}, brand={brand}, target={target}, rows={len(df_b):,}) ──")
+    min_rows = int((N_INNER_FOLDS * 2) / (1 - test_frac)) + 1
+    if len(df_b) < min_rows:
+        raise RuntimeError(f"Insufficient samples for {brand}/{target}: {len(df_b)} < {min_rows}")
 
     fold_records = run_nested_cv(
         model_name=model_name, df_current=df, df_test_source=None,
         brand=brand, target=target, feature_cols=feature_cols, num_cols=num_cols,
-        n_outer_folds=N_OUTER_FOLDS, n_inner_folds=N_INNER_FOLDS,
+        n_inner_folds=N_INNER_FOLDS,
         n_optuna_trials=n_trials, random_state=RANDOM_STATE, optuna_seed=OPTUNA_SEED,
         plot_save_dir=None, plot_target_label=target,
+        split_mode="holdout", inner_split="ts", test_frac=test_frac,
     )
     if not fold_records:
-        raise RuntimeError(f"No outer folds completed for {brand}/{target}.")
+        raise RuntimeError(f"No holdout fold completed for {brand}/{target}.")
 
     summary = summarize_fold_records(fold_records)
-    print(f"\n  Score  MAE={summary['MAE']:.4f} ± {summary['MAE_std']:.4f}  "
-          f"RMSE={summary['RMSE']:.4f} ± {summary['RMSE_std']:.4f}  "
-          f"R²={summary['R2']:.4f} ± {summary['R2_std']:.4f}  "
-          f"MAPE={summary['MAPE(%)']:.2f}%")
+    print(f"\n  Forward score  MAE={summary['MAE']:.4f}  RMSE={summary['RMSE']:.4f}  "
+          f"R²={summary['R2']:.4f}  MAPE={summary['MAPE(%)']:.2f}%")
     return summary, fold_records
 
 
@@ -136,11 +139,12 @@ def phase_b_freeze(df, cfg, model_name, brand, target, n_trials, feature_cols):
     print(f"\n── Phase B: final weight ({model_name}, {len(X_full):,} rows, "
           f"{len(feature_order)} features) ──")
 
-    # One Optuna pass on the full data (inner 5-fold CV), same search space as the notebook.
+    # One Optuna pass on the full data (inner TimeSeriesSplit CV), same search space as the notebook.
     sampler = optuna.samplers.TPESampler(seed=OPTUNA_SEED, n_startup_trials=5)
     study = optuna.create_study(direction="minimize", sampler=sampler,
                                 study_name=f"{model_name}_{target}_{brand}_full")
-    objective = make_objective(model_name, X_full, y_full, N_INNER_FOLDS, RANDOM_STATE)
+    objective = make_objective(model_name, X_full, y_full, N_INNER_FOLDS, RANDOM_STATE,
+                               inner_split="ts")
     study.optimize(objective, n_trials=n_trials, show_progress_bar=False)
     print(f"  Best inner-CV MAE: {study.best_value:.4f}")
 
@@ -152,7 +156,7 @@ def phase_b_freeze(df, cfg, model_name, brand, target, n_trials, feature_cols):
 
 def _write_artifact(out_dir, stamp, model, metadata, cv_report_df, target, brand):
     """Write model.joblib + metadata.json + cv_report to canonical out_dir AND runs/<stamp>/."""
-    cv_name = f"cv_report_{target}_{brand}.csv"
+    cv_name = f"cv_report_holdout_{target}_{brand}.csv"
     for d in (out_dir, out_dir / "runs" / stamp):
         d.mkdir(parents=True, exist_ok=True)
         joblib.dump(model, d / "model.joblib")
@@ -162,12 +166,14 @@ def _write_artifact(out_dir, stamp, model, metadata, cv_report_df, target, brand
 
 
 def main():
-    ap = argparse.ArgumentParser(description="Train + freeze APC predictor (nested-CV report + refit).")
+    ap = argparse.ArgumentParser(description="Train + freeze APC predictor (forward-holdout report + refit).")
     ap.add_argument("--cm", required=True, help="Cement mill / pot (locks model arch via pot_config).")
     ap.add_argument("--target", default="psd_r30", help="Target variable (default psd_r30).")
     ap.add_argument("--brand", default=None, help="Brand (default = pot's first optimization brand).")
     ap.add_argument("--data", default=None, help="Merged CSV (default = pot_config merged_data_path).")
     ap.add_argument("--optuna-trials", type=int, default=25, help="Optuna trials per tuning (default 25).")
+    ap.add_argument("--test-frac", type=float, default=DEFAULT_TEST_FRAC,
+                    help=f"Forward-holdout test fraction, most-recent rows (default {DEFAULT_TEST_FRAC}).")
     ap.add_argument("--feat-eng", default=DEFAULT_FEAT_ENG,
                     help=f"feat_eng experiment applied to every pot (default {DEFAULT_FEAT_ENG!r}). "
                          "Use 'none' to disable.")
@@ -212,8 +218,11 @@ def main():
             "pot": args.cm, "data_source": data_path.name, "n_rows": len(df),
             **cfg["data_recipe"], "feature_set": list(feature_cols),
             "feat_eng": feat_eng_exp, "fe_features": fe_features,
-            "outer_cv": {"folds": N_OUTER_FOLDS, "shuffle": True, "seed": RANDOM_STATE},
-            "inner_cv": {"folds": N_INNER_FOLDS, "shuffle": True, "seed": RANDOM_STATE},
+            "eval_scheme": {
+                "scheme": "forward_holdout", "test_frac": args.test_frac,
+                "inner": "TimeSeriesSplit", "inner_folds": N_INNER_FOLDS,
+                "training_start": str(cfg.get("training_start")) if cfg.get("training_start") else None,
+            },
             "n_optuna_trials": args.optuna_trials,
             "model_name": model_name, "target": target, "brand": brand,
         }
@@ -221,9 +230,9 @@ def main():
                          extra_tags={"model_name": model_name, "target": target, "brand": brand})
 
     try:
-        # Phase A — honest score.
+        # Phase A — honest forward score.
         summary, fold_records = phase_a_report(df, cfg, model_name, brand, target,
-                                               args.optuna_trials, feature_cols)
+                                               args.optuna_trials, feature_cols, args.test_frac)
 
         if use_mlflow:
             start_intermediate_run(target=target, brand=brand, model_name=model_name)
@@ -263,6 +272,8 @@ def main():
             "feat_eng": feat_eng_exp, "fe_features": fe_features,
             "sep_motor_speed_bounds": [float(sep.min()), float(sep.max()), float(args.step)],
             "model_mae": float(summary["MAE"]),
+            "eval_scheme": "forward_holdout",
+            "test_frac": float(args.test_frac),
             "is_autogluon": False,
             "trained_through": str(pd.to_datetime(df_b["hour"]).max().date()),
             "trained_at": stamp,
@@ -276,7 +287,7 @@ def main():
         if use_mlflow:
             finalize_parent_summary({"model_mae": float(summary["MAE"]),
                                      "final_inner_cv_mae": best_inner_mae})
-            for fname in ("model.joblib", "metadata.json", f"cv_report_{target}_{brand}.csv"):
+            for fname in ("model.joblib", "metadata.json", f"cv_report_holdout_{target}_{brand}.csv"):
                 log_parent_artifact(out_dir / fname)
     finally:
         if use_mlflow:

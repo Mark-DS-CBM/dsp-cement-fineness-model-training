@@ -76,3 +76,20 @@ Optuna/NSGA variants were omitted to stay dependency-light).
   production predicts forward in time, so an IID score is not by itself proof of forward performance.
 - **MAE target is blaine-specific:** the ≈20 bar is for blaine; `psd_r30` is a different scale and
   needs its own acceptance threshold.
+
+## Deployment Acceptance Gate — Forward Holdout (DEFERRED / TODO)
+
+**Status: not yet implemented.** `scripts/model_train.py` currently reports **only** the shuffled-IID
+nested-CV MAE (Phase A) as the model score, then refits on all data for the frozen weight (Phase B).
+This is the textbook estimate-then-refit pattern and the nested-CV number is a slightly conservative
+estimate of the deployed model's performance — but it is *not* by itself proof of **forward** behavior.
+
+**Why a forward holdout is still wanted:** production always predicts forward in time, whereas shuffled
+IID CV scores on randomly interleaved rows. The honest deployment evidence is a **most-recent-window
+holdout** — train through date *T*, score on the last ~2–4 weeks. If that forward MAE is close to the
+IID nested-CV MAE, the model genuinely holds up live; a large gap is an early drift signal. Add this to
+`model_train.py` Phase A as a second reported number + an explicit pass/fail gate before promoting a
+weight to deployment.
+
+**Threshold caveat:** the **MAE ≈ 20 bar is blaine-specific** (operator noise floor). `psd_r30` is on a
+different scale and needs its own acceptance threshold — do not reuse 20 for it.
